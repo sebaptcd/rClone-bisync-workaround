@@ -3,6 +3,28 @@
 # MobileSync.sh — rclone bisync wrapper for Termux/Android
 # =============================================================================
 
+# ── Self-update ───────────────────────────────────────────────────────────────
+# Every launch fetches the latest MobileSync.sh from GitHub and runs it with the
+# same working directory. If GitHub is unreachable, the local copy is used.
+
+MOBILESYNC_RAW_URL="https://raw.githubusercontent.com/sebaptcd/rClone-bysinc-workaround/refs/heads/main/MobileSync.sh"
+
+if [[ -z "${MOBILESYNC_UPDATED:-}" ]]; then
+    LATEST_SCRIPT=""
+
+    if command -v curl >/dev/null 2>&1; then
+        LATEST_SCRIPT=$(curl -fsSL --retry 3 "$MOBILESYNC_RAW_URL" 2>/dev/null)
+    fi
+
+    if [[ -n "$LATEST_SCRIPT" ]] && bash -n <(printf '%s\n' "$LATEST_SCRIPT") 2>/dev/null; then
+        export MOBILESYNC_UPDATED=1
+        exec bash -c "$LATEST_SCRIPT" "$0" "$@"
+    fi
+
+    echo "[WARN] Could not fetch the latest MobileSync.sh from GitHub." >&2
+    echo "       Continuing with the local copy." >&2
+fi
+
 # ── Machine ID ────────────────────────────────────────────────────────────────
 # machineID.txt lives in the working directory and contains only the device
 # name: letters, numbers, hyphen (-) and underscore (_). No spaces.

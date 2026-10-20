@@ -4,25 +4,52 @@
 # =============================================================================
 
 # ── Machine ID ────────────────────────────────────────────────────────────────
-# machineID.txt must exist in the working directory and contain only the device
+# machineID.txt lives in the working directory and contains only the device
 # name: letters, numbers, hyphen (-) and underscore (_). No spaces.
+# If it is missing, the script prompts for a valid name and creates the file.
 
 MACHINE_ID_FILE="machineID.txt"
 
 if [[ ! -f "$MACHINE_ID_FILE" ]]; then
-    cat >&2 <<'EOF'
-[ERR!] machineID.txt is required but was not found in the current directory.
+    echo "" >&2
+    echo "[WARN] machineID.txt was not found in the current directory." >&2
+    echo "       Let's create it now." >&2
+    echo "" >&2
+    echo "       Use only your device name, with no spaces." >&2
+    echo "       Allowed characters: letters (A-Z, a-z), numbers (0-9)," >&2
+    echo "       hyphen (-) and underscore (_)." >&2
+    echo "       Example: WATER-LION" >&2
+    echo "" >&2
 
-       Create a file named "machineID.txt" containing only your device name,
-       with no spaces or line breaks. Allowed characters:
-       letters (A-Z, a-z), numbers (0-9), hyphen (-) and underscore (_).
+    if [[ ! -t 0 ]]; then
+        echo "[ERR!] Cannot prompt for a device name because stdin is not a terminal." >&2
+        echo "       Create machineID.txt manually in the current directory." >&2
+        exit 1
+    fi
 
-       Example contents: WATER-LION
-EOF
-    exit 1
+    while true; do
+        if ! read -rp " Device name: " MACHINE_ID; then
+            echo "" >&2
+            echo "[ERR!] No device name provided. Aborting." >&2
+            exit 1
+        fi
+
+        if [[ "$MACHINE_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            if printf '%s\n' "$MACHINE_ID" > "$MACHINE_ID_FILE"; then
+                chmod 600 "$MACHINE_ID_FILE" 2>/dev/null || true
+                echo "[ OK ] Created ${MACHINE_ID_FILE} with device name: ${MACHINE_ID}" >&2
+                break
+            else
+                echo "[ERR!] Could not write ${MACHINE_ID_FILE}." >&2
+                exit 1
+            fi
+        else
+            echo "[ERR!] Invalid device name. Use letters, numbers, - and _ only (no spaces)." >&2
+        fi
+    done
+else
+    MACHINE_ID=$(<"$MACHINE_ID_FILE")
 fi
-
-MACHINE_ID=$(<"$MACHINE_ID_FILE")
 
 if [[ ! "$MACHINE_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
     cat >&2 <<EOF

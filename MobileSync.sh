@@ -3,49 +3,60 @@
 # MobileSync.sh — rclone bisync wrapper for Termux/Android
 # =============================================================================
 
-# ── Self-update ───────────────────────────────────────────────────────────────
-# Every launch fetches the latest MobileSync.sh from GitHub and runs it with the
-# same working directory. If GitHub is unreachable, the local copy is used.
-
-MOBILESYNC_RAW_URL="https://raw.githubusercontent.com/sebaptcd/rClone-bysinc-workaround/refs/heads/main/MobileSync.sh"
-
-if [[ -z "${MOBILESYNC_UPDATED:-}" ]]; then
-    LATEST_SCRIPT=""
-
-    if command -v curl >/dev/null 2>&1; then
-        LATEST_SCRIPT=$(curl -fsSL --retry 3 "$MOBILESYNC_RAW_URL" 2>/dev/null)
-    fi
-
-    if [[ -n "$LATEST_SCRIPT" ]] && bash -n <(printf '%s\n' "$LATEST_SCRIPT") 2>/dev/null; then
-        export MOBILESYNC_UPDATED=1
-        exec bash -c "$LATEST_SCRIPT" "$0" "$@"
-    fi
-
-    echo "[WARN] Could not fetch the latest MobileSync.sh from GitHub." >&2
-    echo "       Continuing with the local copy." >&2
-fi
-
 # ── Machine ID ────────────────────────────────────────────────────────────────
-# machineID.txt lives in the working directory and contains only the device
-# name: letters, numbers, hyphen (-) and underscore (_). No spaces.
-# If it is missing, the script prompts for a valid name and creates the file.
+# The machine ID can come from (in order):
+#   1. MACHINE_ID environment variable
+#   2. machineID.txt in the working directory
+#   3. An interactive prompt
+#
+# In ephemeral mode (MOBILESYNC_EPHEMERAL=1) a prompted ID is used for this run
+# only and is never written to disk.
+#
+# Format: letters, numbers, hyphen (-) and underscore (_). No spaces.
 
 MACHINE_ID_FILE="machineID.txt"
+EPHEMERAL="${MOBILESYNC_EPHEMERAL:-0}"
 
-if [[ ! -f "$MACHINE_ID_FILE" ]]; then
-    echo "" >&2
-    echo "[WARN] machineID.txt was not found in the current directory." >&2
-    echo "       Let's create it now." >&2
-    echo "" >&2
+valid_machine_id() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+machine_id_instructions() {
     echo "       Use only your device name, with no spaces." >&2
     echo "       Allowed characters: letters (A-Z, a-z), numbers (0-9)," >&2
     echo "       hyphen (-) and underscore (_)." >&2
     echo "       Example: WATER-LION" >&2
+}
+
+if [[ -n "${MACHINE_ID:-}" ]]; then
+    if ! valid_machine_id "$MACHINE_ID"; then
+        echo "" >&2
+        echo "[ERR!] Invalid MACHINE_ID: '${MACHINE_ID}'" >&2
+        machine_id_instructions
+        exit 1
+    fi
+elif [[ -f "$MACHINE_ID_FILE" ]]; then
+    MACHINE_ID=$(<"$MACHINE_ID_FILE")
+    if ! valid_machine_id "$MACHINE_ID"; then
+        echo "" >&2
+        echo "[ERR!] Invalid machine ID in \"${MACHINE_ID_FILE}\": '${MACHINE_ID}'" >&2
+        machine_id_instructions
+        exit 1
+    fi
+else
+    echo "" >&2
+    echo "[WARN] No machine ID was provided." >&2
+    if [[ "$EPHEMERAL" == "1" ]]; then
+        echo "       Enter a device name for this run (it will not be saved)." >&2
+    else
+        echo "       Enter a device name to create ${MACHINE_ID_FILE}." >&2
+    fi
+    machine_id_instructions
     echo "" >&2
 
     if [[ ! -t 0 ]]; then
         echo "[ERR!] Cannot prompt for a device name because stdin is not a terminal." >&2
-        echo "       Create machineID.txt manually in the current directory." >&2
+        echo "       Set MACHINE_ID or create machineID.txt manually." >&2
         exit 1
     fi
 
@@ -56,7 +67,12 @@ if [[ ! -f "$MACHINE_ID_FILE" ]]; then
             exit 1
         fi
 
-        if [[ "$MACHINE_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        if valid_machine_id "$MACHINE_ID"; then
+            if [[ "$EPHEMERAL" == "1" ]]; then
+                echo "[ OK ] Using device name for this run: ${MACHINE_ID} (not saved)" >&2
+                break
+            fi
+
             if printf '%s\n' "$MACHINE_ID" > "$MACHINE_ID_FILE"; then
                 chmod 600 "$MACHINE_ID_FILE" 2>/dev/null || true
                 echo "[ OK ] Created ${MACHINE_ID_FILE} with device name: ${MACHINE_ID}" >&2
@@ -69,21 +85,6 @@ if [[ ! -f "$MACHINE_ID_FILE" ]]; then
             echo "[ERR!] Invalid device name. Use letters, numbers, - and _ only (no spaces)." >&2
         fi
     done
-else
-    MACHINE_ID=$(<"$MACHINE_ID_FILE")
-fi
-
-if [[ ! "$MACHINE_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    cat >&2 <<EOF
-[ERR!] Invalid machine ID in "${MACHINE_ID_FILE}": '${MACHINE_ID}'
-
-       The file must contain only your device name, with no spaces.
-       Allowed characters: letters (A-Z, a-z), numbers (0-9),
-       hyphen (-) and underscore (_).
-
-       Example contents: WATER-LION
-EOF
-    exit 1
 fi
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -282,8 +283,9 @@ wait_for_lock() {
 # then cleared so subsequent cycles run normally.
 run_sync_cycle() {
     local is_first_run="${1:-false}"
-    local local_log="./mobilesync_cycle.log"
     local live_log_remote="$LOG_REMOTE_PATH/LIVE_LOG.txt"
+    LOCAL_LOG_FILE="${TMPDIR:-/tmp}/mobilesync_cycle.$$.log"
+    local local_log="$LOCAL_LOG_FILE"
     : > "$local_log"
 
     # Start background "log heartbeat" to provide live visibility
@@ -293,7 +295,7 @@ run_sync_cycle() {
             sleep 15
         done
     ) &
-    local LOG_HEARTBEAT_PID=$!
+    LOG_HEARTBEAT_PID=$!
 
     for i in "${!REMOTE_NAMES[@]}"; do
         local remote="${REMOTE_NAMES[$i]}"
@@ -318,6 +320,7 @@ run_sync_cycle() {
     if [[ -n "${LOG_HEARTBEAT_PID:-}" ]]; then
         kill "$LOG_HEARTBEAT_PID" 2>/dev/null
         wait "$LOG_HEARTBEAT_PID" 2>/dev/null
+        LOG_HEARTBEAT_PID=""
     fi
     
     if [[ -f "$local_log" ]]; then
@@ -330,12 +333,34 @@ run_sync_cycle() {
         rclone delete "$LOG_REMOTE_PATH" --min-age 24h
         rm -f "$local_log"
     fi
+    LOCAL_LOG_FILE=""
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+LOCAL_LOG_FILE=""
+LOG_HEARTBEAT_PID=""
+
+cleanup() {
+    stop_lock_heartbeat
+
+    if [[ -n "${LOG_HEARTBEAT_PID:-}" ]]; then
+        kill "$LOG_HEARTBEAT_PID" 2>/dev/null
+        wait "$LOG_HEARTBEAT_PID" 2>/dev/null
+        LOG_HEARTBEAT_PID=""
+    fi
+
+    if [[ -n "${LOCAL_LOG_FILE:-}" ]]; then
+        rm -f "$LOCAL_LOG_FILE"
+        LOCAL_LOG_FILE=""
+    fi
+
+    command -v termux-wake-unlock >/dev/null && termux-wake-unlock
+}
+
 # Clean up on Ctrl+C / SIGTERM so the remote lock is always removed
-trap 'echo -e "\n"; log_msg "WARN" "Interrupted. Cleaning up…"; stop_lock_heartbeat; command -v termux-wake-unlock >/dev/null && termux-wake-unlock; exit 0' INT TERM
+trap 'echo -e "\n"; log_msg "WARN" "Interrupted. Cleaning up…"; cleanup; exit 0' INT TERM
+trap 'cleanup' EXIT
 
 # Hold a wake-lock to ensure the CPU doesn't sleep in the background
 # BATTERY SAVER: Comment out the line below to let CPU sleep (saves battery, but timing becomes less accurate)

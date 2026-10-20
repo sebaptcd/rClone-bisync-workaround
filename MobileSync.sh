@@ -71,9 +71,11 @@ SYNC_LOCK_DIR="Dev:syncControl/"
 SYNC_LOCK_REMOTE="Dev:syncControl/syncTime.lock"
 LOG_REMOTE_PATH="Dev:syncControl/Logs/${MACHINE_ID}"
 
-BISYNC_FLAGS="--recover --transfers 64 --checkers 48 --create-empty-src-dirs --force --max-lock 600"
+BISYNC_FLAGS="--recover --resilient --transfers 64 --checkers 48 --create-empty-src-dirs --force --max-lock 600 --color NEVER"
 LOCK_TIMEOUT=120   # seconds before a remote lock is considered stale
 SYNC_INTERVAL=300  # seconds to wait between sync cycles
+LOCK_CHECK_RETRIES=3      # attempts to read the remote lock before skipping a cycle
+LOCK_CHECK_RETRY_DELAY=10 # seconds between lock-check attempts
 
 # Define remotes as parallel arrays: REMOTE_NAME[i] <-> LOCAL_PATH[i]
 REMOTE_NAMES=(
@@ -124,13 +126,35 @@ log_msg() {
     echo -e "${CLR_DIM}${timestamp}${CLR_RESET} ${color}${prefix}${CLR_RESET} $*"
 }
 
+# Returns success when an rclone error only means "the path/file does not exist".
+# Deliberately does not match generic "not found" text (for example the
+# "Config file ... not found" notice), so real login errors are not mistaken
+# for a missing lock file.
+is_not_found_error() {
+    printf '%s\n' "${1:-}" | grep -Eiq 'itemNotFound|Item not found|directory not found|object not found|path not found|File not found|no such file|does not exist|doesn.t exist|Error 404'
+}
 
+# Returns success when the output contains an authentication/login failure.
+contains_auth_error() {
+    printf '%s\n' "${1:-}" | grep -Eiq 'expired_access_token|InvalidAuthenticationToken|AuthenticationException|invalid_grant|token (has )?expired|401 Unauthorized|Unauthorized|permission denied|access_denied|oauth2|cannot fetch token|reauthenticate|re-authenticate'
+}
+
+# Returns success when bisync says the pair needs a manual --resync.
+contains_resync_required() {
+    printf '%s\n' "${1:-}" | grep -Eq 'Bisync critical error|Must run --resync|Bisync aborted'
+}
 
 notify() {
     local title="$1"
     local body="$2"
-    # notify-send may not be available in all Termux setups; guard gracefully
-    command -v notify-send &>/dev/null && notify-send "$title" "$body"
+
+    # Termux has termux-notification; desktop Linux has notify-send.
+    if command -v termux-notification &>/dev/null; then
+        termux-notification --title "$title" --content "$body" >/dev/null 2>&1 || true
+    elif command -v notify-send &>/dev/null; then
+        notify-send "$title" "$body" >/dev/null 2>&1 || true
+    fi
+
     log_msg "INFO" "${CLR_BOLD}${title}:${CLR_RESET} $body"
 }
 
@@ -185,60 +209,171 @@ select_resync_remotes() {
 
 # ── Sync-lock helpers ──────────────────────────────────────────────────────────
 
+# Remove the remote lock file. Missing files (exit 3/4) are not errors.
+remove_remote_lock() {
+    local purpose="$1"
+    local delete_error
+
+    if ! delete_error=$(rclone delete "$SYNC_LOCK_REMOTE" --color NEVER 2>&1); then
+        if ! is_not_found_error "$delete_error"; then
+            log_msg "WARN" "Could not remove ${purpose}: ${delete_error:-unknown error}"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # Write our timestamp+machineID to the remote lock file every 5 s (background).
-# Sets global $LOCK_PID.
+# Sets global $LOCK_PID. Heartbeat failures are shown once, then at most once
+# per minute, so a broken Dev: remote does not flood the terminal.
 start_lock_heartbeat() {
+    local err_file="${TMPDIR:-/tmp}/mobilesync_lock_hb.$$.err"
+    local error_flag="${TMPDIR:-/tmp}/mobilesync_lock_hb.$$.flag"
+
+    : > "$err_file"
+    rm -f "$error_flag"
+
     (
+        local last_error_time=0
+
         while true; do
-            echo "$(get_epoch) ${MACHINE_ID}" | rclone rcat "$SYNC_LOCK_REMOTE" 2>/dev/null
+            local now heartbeat_error
+
+            if echo "$(get_epoch) ${MACHINE_ID}" | rclone rcat "$SYNC_LOCK_REMOTE" --color NEVER 2>"$err_file"; then
+                last_error_time=0
+                rm -f "$error_flag"
+            else
+                : > "$error_flag"
+                heartbeat_error=$(<"$err_file")
+                now=$(get_epoch)
+
+                if (( last_error_time == 0 || now - last_error_time >= 60 )); then
+                    log_msg "ERROR" "Could not refresh remote lock: ${heartbeat_error:-unknown error}"
+                    last_error_time=$now
+                fi
+            fi
+
             sleep 5
         done
     ) &
+
     LOCK_PID=$!
+    LOCK_HB_ERR_FILE="$err_file"
+    LOCK_HB_ERROR_FLAG="$error_flag"
     log_msg "INFO" "  └─ Heartbeat active (PID $LOCK_PID)."
 }
 
 stop_lock_heartbeat() {
     if [[ -n "${LOCK_PID:-}" ]]; then
         kill "$LOCK_PID" 2>/dev/null
-        rclone delete "$SYNC_LOCK_REMOTE" 2>/dev/null
+        wait "$LOCK_PID" 2>/dev/null
+
+        if [[ -n "${LOCK_HB_ERROR_FLAG:-}" && -f "$LOCK_HB_ERROR_FLAG" ]]; then
+            CYCLE_ISSUES=$(( CYCLE_ISSUES + 1 ))
+            rm -f "$LOCK_HB_ERROR_FLAG"
+        fi
+
+        if [[ -n "${LOCK_HB_ERR_FILE:-}" ]]; then
+            rm -f "$LOCK_HB_ERR_FILE"
+        fi
+
+        if ! remove_remote_lock "remote lock"; then
+            CYCLE_ISSUES=$(( CYCLE_ISSUES + 1 ))
+        fi
+
         log_msg "INFO" "  └─ Heartbeat stopped."
         LOCK_PID=""
+        LOCK_HB_ERR_FILE=""
+        LOCK_HB_ERROR_FLAG=""
     fi
 }
 
 wait_for_lock() {
     log_msg "INFO" "Checking remote sync lock..."
+
+    local attempt=0
+
     while true; do
-        local remote_file
-        remote_file=$(rclone lsf "$SYNC_LOCK_REMOTE" 2>/dev/null)
+        local remote_file lock_error
+
+        # Keep stdout clean for the filename comparison. If the call fails,
+        # run it again with stderr captured so the real cause can be shown.
+        if ! remote_file=$(rclone lsf "$SYNC_LOCK_REMOTE" --color NEVER 2>/dev/null); then
+            if lock_error=$(rclone lsf "$SYNC_LOCK_REMOTE" --color NEVER 2>&1); then
+                remote_file="$lock_error"
+            elif is_not_found_error "$lock_error"; then
+                remote_file=""
+            else
+                attempt=$(( attempt + 1 ))
+                log_msg "ERROR" "Could not check remote sync lock (attempt ${attempt}/${LOCK_CHECK_RETRIES}): ${lock_error:-unknown error}"
+
+                if (( attempt >= LOCK_CHECK_RETRIES )); then
+                    log_msg "ERROR" "Remote lock is unavailable. Skipping this cycle."
+                    return 1
+                fi
+
+                sleep "$LOCK_CHECK_RETRY_DELAY"
+                continue
+            fi
+        fi
 
         if [[ "$remote_file" != "syncTime.lock" ]]; then
             log_msg "SUCCESS" "Lock clear. Proceeding."
-            return
+            return 0
         fi
 
-        local lock_contents
-        lock_contents=$(rclone cat "$SYNC_LOCK_REMOTE" 2>/dev/null)
+        local lock_contents=""
+        if ! lock_contents=$(rclone cat "$SYNC_LOCK_REMOTE" --color NEVER 2>/dev/null); then
+            local cat_error
+            if cat_error=$(rclone cat "$SYNC_LOCK_REMOTE" --color NEVER 2>&1); then
+                lock_contents="$cat_error"
+            elif is_not_found_error "$cat_error"; then
+                log_msg "WARN" "Remote lock disappeared while reading it. Retrying..."
+                sleep 1
+                continue
+            else
+                attempt=$(( attempt + 1 ))
+                log_msg "ERROR" "Could not read remote sync lock (attempt ${attempt}/${LOCK_CHECK_RETRIES}): ${cat_error:-unknown error}"
+
+                if (( attempt >= LOCK_CHECK_RETRIES )); then
+                    log_msg "ERROR" "Remote lock is unavailable. Skipping this cycle."
+                    return 1
+                fi
+
+                sleep "$LOCK_CHECK_RETRY_DELAY"
+                continue
+            fi
+        fi
 
         # Treat an itemNotFound error response as "no lock"
-        if echo "$lock_contents" | grep -q '"error":.*"code":"itemNotFound"\|Item not found'; then
+        if printf '%s\n' "$lock_contents" | grep -q '"error":.*"code":"itemNotFound"\|Item not found'; then
             log_msg "WARN" "Remote lock not found (API quirk). Retrying..."
             sleep 1
             continue
         fi
 
         local lock_epoch lock_machine
-        lock_epoch=$(echo "$lock_contents" | awk '{print $1}')
-        lock_machine=$(echo "$lock_contents" | awk '{print $2}')
+        lock_epoch=$(printf '%s\n' "$lock_contents" | awk '{print $1}')
+        lock_machine=$(printf '%s\n' "$lock_contents" | awk '{print $2}')
+
+        if [[ ! "$lock_epoch" =~ ^[0-9]+$ ]]; then
+            log_msg "WARN" "Malformed remote lock (contents: '${lock_contents}'). Removing it."
+            if ! remove_remote_lock "malformed remote lock"; then
+                return 1
+            fi
+            continue
+        fi
 
         # If the lock belongs to THIS machine it is a leftover from the previous
         # cycle that stop_lock_heartbeat hadn't fully cleaned yet — remove it and
         # proceed immediately instead of waiting 60 s.
         if [[ "$lock_machine" == "$MACHINE_ID" ]]; then
             log_msg "INFO" "Our previous lock detected. Removing."
-            rclone delete "$SYNC_LOCK_REMOTE" 2>/dev/null
-            return
+            if ! remove_remote_lock "our previous lock"; then
+                return 1
+            fi
+            return 0
         fi
 
         local age=$(( $(get_epoch) - lock_epoch ))
@@ -250,7 +385,9 @@ wait_for_lock() {
         else
             log_msg "WARN" "Stale lock from $lock_machine detected. Overriding."
             notify "MobileSync" "Overriding stale lock."
-            rclone delete "$SYNC_LOCK_REMOTE"
+            if ! remove_remote_lock "stale remote lock"; then
+                return 1
+            fi
         fi
     done
 }
@@ -262,14 +399,34 @@ wait_for_lock() {
 run_sync_cycle() {
     local is_first_run="${1:-false}"
     local live_log_remote="$LOG_REMOTE_PATH/LIVE_LOG.txt"
-    LOCAL_LOG_FILE="${TMPDIR:-/tmp}/mobilesync_cycle.$$.log"
+    local heartbeat_flag
+    LOCAL_LOG_FILE="${TMPDIR:-/tmp}/mobilesync_cycle.$$.${CYCLE:-0}.log"
     local local_log="$LOCAL_LOG_FILE"
+    heartbeat_flag="${local_log}.heartbeat_error"
     : > "$local_log"
+    rm -f "$heartbeat_flag"
 
-    # Start background "log heartbeat" to provide live visibility
+    # Start background "log heartbeat" to provide live visibility.
+    # Failures are shown once, then at most once per minute.
     (
+        local last_error_time=0
+
         while [[ -f "$local_log" ]]; do
-            rclone copyto "$local_log" "$live_log_remote" 2>/dev/null
+            local now copy_error
+
+            if ! copy_error=$(rclone copyto "$local_log" "$live_log_remote" --color NEVER 2>&1); then
+                : > "$heartbeat_flag"
+                now=$(get_epoch)
+
+                if (( last_error_time == 0 || now - last_error_time >= 60 )); then
+                    log_msg "WARN" "Could not update the live log: ${copy_error:-unknown error}"
+                    last_error_time=$now
+                fi
+            else
+                last_error_time=0
+                rm -f "$heartbeat_flag"
+            fi
+
             sleep 15
         done
     ) &
@@ -280,17 +437,91 @@ run_sync_cycle() {
         local local_path="${LOCAL_PATHS[$i]}"
         local label="${REMOTE_LABELS[$i]}"
         local extra_flags=""
+        local log_offset run_output run_start rc
+        local failed=false
+        local rc_label
+        local failure_reason
 
         if [[ "$is_first_run" == "true" && -n "${RESYNC_FLAGS[$i]:-}" ]]; then
             extra_flags="${RESYNC_FLAGS[$i]}"
             RESYNC_FLAGS[$i]=""   # clear after first use
         fi
 
+        log_offset=$(wc -l < "$local_log" | tr -d '[:space:]')
+        printf '\n===== %s | %s | %s <-> %s =====\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$label" "$remote" "$local_path" >> "$local_log"
+
         log_msg "INFO" "  ┌ Syncing: ${CLR_CYAN}${label}${CLR_RESET} $extra_flags"
+
+        # Stream rclone's output: keep the full log, show ERROR/CRITICAL/NOTICE
+        # lines in the terminal as they happen. PIPESTATUS[0] is rclone's exit
+        # code, because the pipeline itself would hide it.
         # shellcheck disable=SC2086
         rclone bisync "$remote" "$local_path" $BISYNC_FLAGS $extra_flags \
-            --log-file "$local_log" --log-level INFO
-        log_msg "SUCCESS" "  └─ Done: $label"
+            --log-level INFO 2>&1 \
+            | tee -a "$local_log" \
+            | while IFS= read -r line; do
+                case "$line" in
+                    *ERROR*|*CRITICAL*|*"Failed to"*|*"fatal error"*|*"Errors:"*|*expired_access_token*|*InvalidAuthenticationToken*|*AuthenticationException*|*invalid_grant*|*"permission denied"*|*Unauthorized*|*unauthorized*|*"command not found"*)
+                        printf "${CLR_ERROR}[rclone] %s${CLR_RESET}\n" "$line"
+                        ;;
+                    *NOTICE:*|*WARNING*)
+                        printf "${CLR_WARN}[rclone] %s${CLR_RESET}\n" "$line"
+                        ;;
+                esac
+            done
+        rc=${PIPESTATUS[0]}
+        rc_label="exit ${rc}"
+
+        run_start=$(( log_offset + 1 ))
+        run_output=$(tail -n "+${run_start}" "$local_log")
+
+        if (( rc != 0 )); then
+            failed=true
+        fi
+
+        if contains_resync_required "$run_output"; then
+            failed=true
+            if (( rc == 0 )); then
+                rc_label="exit 0 but critical error logged"
+            fi
+        fi
+
+        failure_reason=$(printf '%s\n' "$run_output" | grep -E 'ERROR|CRITICAL' | tail -n 1)
+        if [[ -z "$failure_reason" ]]; then
+            failure_reason="rclone ${rc_label}"
+        fi
+
+        if [[ "$failed" == "true" ]]; then
+            log_msg "ERROR" "  └─ FAILED: ${label} (${rc_label})"
+            log_msg "ERROR" "     Last error: ${failure_reason}"
+
+            CYCLE_FAILURES=$(( CYCLE_FAILURES + 1 ))
+            CYCLE_FAILED_LABELS+=("$label")
+            CYCLE_FAILED_SUMMARY+=("${label} (${rc_label}): ${failure_reason}")
+
+            if contains_auth_error "$run_output"; then
+                local remote_name="${remote%%:*}"
+                log_msg "ERROR" "Authentication for remote '${remote_name}' failed or expired."
+                log_msg "INFO" "Fix: rclone config reconnect ${remote_name}:"
+                log_msg "INFO" "Then restart MobileSync.sh and choose --resync for '${label}' if rclone requires it."
+            fi
+
+            if (( rc == 2 )); then
+                log_msg "ERROR" "rclone rejected the command (exit 2). Check BISYNC_FLAGS and the remote/local paths."
+            fi
+
+            if (( rc == 7 )) || contains_resync_required "$run_output"; then
+                log_msg "WARN" "'${label}' is locked out until a --resync succeeds."
+                log_msg "INFO" "Resync: rclone bisync \"${remote}\" \"${local_path}\" ${BISYNC_FLAGS} --resync"
+            fi
+
+            printf 'RESULT: FAILED (%s)\n' "$rc_label" >> "$local_log"
+        else
+            log_msg "SUCCESS" "  └─ Done: $label"
+            printf 'RESULT: OK\n' >> "$local_log"
+        fi
+
         sleep 1
     done
 
@@ -300,24 +531,59 @@ run_sync_cycle() {
         wait "$LOG_HEARTBEAT_PID" 2>/dev/null
         LOG_HEARTBEAT_PID=""
     fi
-    
+
+    if [[ -f "$heartbeat_flag" ]]; then
+        CYCLE_ISSUES=$(( CYCLE_ISSUES + 1 ))
+        rm -f "$heartbeat_flag"
+    fi
+
     if [[ -f "$local_log" ]]; then
         local remote_log_name="MobileSync_$(date +%Y%m%d_%H%M%S)_${MACHINE_ID}.txt"
+        local upload_error delete_error cleanup_error
         log_msg "INFO" "Uploading logs to cloud..."
-        rclone copyto "$local_log" "$LOG_REMOTE_PATH/$remote_log_name"
-        rclone delete "$live_log_remote" 2>/dev/null
-        
-        log_msg "INFO" "Cleaning up logs older than 1 day..."
-        rclone delete "$LOG_REMOTE_PATH" --min-age 24h
-        rm -f "$local_log"
+
+        if upload_error=$(rclone copyto "$local_log" "$LOG_REMOTE_PATH/$remote_log_name" --color NEVER 2>&1); then
+            if ! delete_error=$(rclone delete "$live_log_remote" --color NEVER 2>&1); then
+                if ! is_not_found_error "$delete_error"; then
+                    log_msg "WARN" "Could not remove the live log: ${delete_error:-unknown error}"
+                    CYCLE_ISSUES=$(( CYCLE_ISSUES + 1 ))
+                fi
+            fi
+
+            log_msg "INFO" "Cleaning up logs older than 1 day..."
+            if ! cleanup_error=$(rclone delete "$LOG_REMOTE_PATH" --min-age 24h --color NEVER 2>&1); then
+                if ! is_not_found_error "$cleanup_error"; then
+                    log_msg "WARN" "Could not clean old logs: ${cleanup_error:-unknown error}"
+                    CYCLE_ISSUES=$(( CYCLE_ISSUES + 1 ))
+                fi
+            fi
+
+            rm -f "$local_log"
+            LOCAL_LOG_FILE=""
+        else
+            log_msg "ERROR" "Could not upload the cycle log: ${upload_error:-unknown error}"
+            log_msg "WARN" "Keeping local log: $local_log"
+            LOCAL_LOG_FILE=""   # keep the file; do not let the EXIT trap delete it
+            CYCLE_ISSUES=$(( CYCLE_ISSUES + 1 ))
+        fi
+    else
+        LOCAL_LOG_FILE=""
     fi
-    LOCAL_LOG_FILE=""
+
+    return 0
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 LOCAL_LOG_FILE=""
 LOG_HEARTBEAT_PID=""
+LOCK_PID=""
+LOCK_HB_ERR_FILE=""
+LOCK_HB_ERROR_FLAG=""
+CYCLE_FAILURES=0
+CYCLE_ISSUES=0
+CYCLE_FAILED_LABELS=()
+CYCLE_FAILED_SUMMARY=()
 
 cleanup() {
     stop_lock_heartbeat
@@ -331,6 +597,14 @@ cleanup() {
     if [[ -n "${LOCAL_LOG_FILE:-}" ]]; then
         rm -f "$LOCAL_LOG_FILE"
         LOCAL_LOG_FILE=""
+    fi
+
+    if [[ -n "${LOCK_HB_ERR_FILE:-}" ]]; then
+        rm -f "$LOCK_HB_ERR_FILE"
+    fi
+
+    if [[ -n "${LOCK_HB_ERROR_FLAG:-}" ]]; then
+        rm -f "$LOCK_HB_ERROR_FLAG"
     fi
 
     command -v termux-wake-unlock >/dev/null && termux-wake-unlock
@@ -353,20 +627,47 @@ CYCLE=0
 while true; do
     (( CYCLE++ ))
 
+    CYCLE_FAILURES=0
+    CYCLE_ISSUES=0
+    CYCLE_FAILED_LABELS=()
+    CYCLE_FAILED_SUMMARY=()
+
     # ── Wait for exclusive sync lock ─────────────────────────────────────────
     timestamp=$(date '+%H:%M:%S')
     echo -e "\n${CLR_BOLD}━━━━ Cycle #${CYCLE} (${timestamp})${CLR_RESET}"
-    wait_for_lock
-    start_lock_heartbeat
 
-    # ── Run syncs ────────────────────────────────────────────────────────────
-    log_msg "INFO" "Starting sync pass..."
-    run_sync_cycle "$FIRST_RUN"
-    FIRST_RUN=false
-    log_msg "SUCCESS" "Cycle #${CYCLE} completed."
+    if wait_for_lock; then
+        start_lock_heartbeat
 
-    # ── Release lock ─────────────────────────────────────────────────────────
-    stop_lock_heartbeat
+        # ── Run syncs ────────────────────────────────────────────────────────
+        log_msg "INFO" "Starting sync pass..."
+        run_sync_cycle "$FIRST_RUN"
+        FIRST_RUN=false
+
+        # ── Release lock ─────────────────────────────────────────────────────
+        stop_lock_heartbeat
+
+        if (( CYCLE_FAILURES == 0 && CYCLE_ISSUES == 0 )); then
+            log_msg "SUCCESS" "Cycle #${CYCLE} completed."
+        elif (( CYCLE_FAILURES == 0 )); then
+            log_msg "WARN" "Cycle #${CYCLE} completed with warnings. See the messages above."
+            notify "MobileSync warning" "Cycle #${CYCLE} completed with warnings. Check the terminal."
+        else
+            log_msg "ERROR" "Cycle #${CYCLE} finished with ${CYCLE_FAILURES}/${#REMOTE_NAMES[@]} remotes failing."
+            for summary in "${CYCLE_FAILED_SUMMARY[@]}"; do
+                log_msg "ERROR" "  ✗ ${summary}"
+            done
+
+            if (( CYCLE_ISSUES > 0 )); then
+                log_msg "WARN" "Additional lock/log errors occurred during this cycle."
+            fi
+
+            notify "MobileSync error" "Cycle #${CYCLE}: ${CYCLE_FAILURES}/${#REMOTE_NAMES[@]} remotes failed: ${CYCLE_FAILED_LABELS[*]}"
+        fi
+    else
+        log_msg "ERROR" "Cycle #${CYCLE} skipped: the remote lock could not be checked."
+        notify "MobileSync error" "Cycle #${CYCLE} skipped: remote lock unavailable. Retrying in ${SYNC_INTERVAL} seconds."
+    fi
 
     echo -e ""
     UI_PAUSED=false

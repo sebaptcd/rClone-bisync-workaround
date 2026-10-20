@@ -353,6 +353,9 @@ Requirements:
 ```bash
 pkg install bash rclone
 termux-setup-storage
+
+# Optional: Android notifications (requires the Termux:API app)
+pkg install termux-api
 ```
 
 Configure your remotes with `rclone config`. Then edit the configuration block at the top of `MobileSync.sh`:
@@ -373,11 +376,34 @@ On first run, choose `--resync` for each remote (`A` = all, `N` = none, `S` = se
 `MobileSync.sh`:
 
 - uses the same lock mechanism as `Syncing.sh` (set `SYNC_LOCK_REMOTE` to `<SyncControl_root>syncControl/syncTime.lock`);
-- syncs each configured pair;
+- syncs each configured pair with `--recover --resilient`;
+- streams rclone `ERROR`, `CRITICAL` and `NOTICE` lines to the terminal while the full output is still written to the log;
+- checks the exit code of every pair: `0` is success, `1` is a non-critical failure, `2` is a command/flag error, and `7` is a critical abort that requires `--resync`;
+- prints the last error and an authentication hint when a login has expired, then continues with the next remote;
+- only reports `Cycle completed` when every pair succeeded. Otherwise it prints a per-remote failure summary and tries again next cycle;
 - uploads a live log and a final log to `Dev:syncControl/Logs/<machineID>/`;
-- deletes remote logs older than 24 hours;
+- deletes remote logs older than 24 hours. If the upload fails, it keeps the local log and prints its path;
+- sends a Termux notification when a cycle fails (`termux-notification`, falling back to `notify-send`);
 - waits 5 minutes between cycles. Press `S` to skip the wait, or `P` to pause/resume the countdown display;
+- if the `Dev:` lock remote cannot be reached, shows the error and skips that cycle instead of syncing without the cross-machine lock. It retries on the next cycle;
 - uses `termux-wake-lock` when available so Android does not suspend the process.
+
+### Authentication errors
+
+rclone's saved logins can expire or be revoked. The script now shows these failures instead of reporting a successful cycle. Common examples:
+
+- `expired_access_token` (Dropbox)
+- `InvalidAuthenticationToken: AuthenticationException` (OneDrive / Microsoft)
+- `invalid_grant` or `Token has been expired or revoked` (Google Drive)
+
+Reconnect the remote shown in the error message:
+
+```bash
+rclone config reconnect Dropbox:
+rclone config reconnect WORKSTATION:
+```
+
+Replace the name with the remote from the error (the script prints the exact command). After reconnecting, start `MobileSync.sh` again and choose `--resync` for the affected remote when the log says `Bisync aborted. Must run --resync to recover.`. A missing login does not stop the other remotes or the loop; the failed pair is simply retried next cycle.
 
 ## Versioning
 

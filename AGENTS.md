@@ -27,6 +27,7 @@
 ## Git workflow
 
 - After every edit, commit the change and push the current branch to GitHub (`origin`) immediately.
+- After each successful push, start your response with `Pushed to {branch} #{short_commit_hash}`, then put everything else after it.
 - Do not finish a response with uncommitted or unpushed changes.
 - Do not ask for confirmation before committing or pushing.
 - Never force-push or rewrite published history unless the user explicitly asks.

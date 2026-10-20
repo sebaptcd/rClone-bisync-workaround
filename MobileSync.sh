@@ -4,18 +4,11 @@
 # =============================================================================
 
 # ── Machine ID ────────────────────────────────────────────────────────────────
-# The machine ID can come from (in order):
-#   1. MACHINE_ID environment variable
-#   2. machineID.txt in the working directory
-#   3. An interactive prompt
-#
-# In ephemeral mode (MOBILESYNC_EPHEMERAL=1) a prompted ID is used for this run
-# only and is never written to disk.
-#
-# Format: letters, numbers, hyphen (-) and underscore (_). No spaces.
+# machineID.txt lives in the working directory and contains only the device
+# name: letters, numbers, hyphen (-) and underscore (_). No spaces.
+# If it is missing, the script prompts for a valid name and creates it here.
 
 MACHINE_ID_FILE="machineID.txt"
-EPHEMERAL="${MOBILESYNC_EPHEMERAL:-0}"
 
 valid_machine_id() {
     [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
@@ -25,17 +18,10 @@ machine_id_instructions() {
     echo "       Use only your device name, with no spaces." >&2
     echo "       Allowed characters: letters (A-Z, a-z), numbers (0-9)," >&2
     echo "       hyphen (-) and underscore (_)." >&2
-    echo "       Example: WATER-LION" >&2
+    echo "       Example: MY-DEVICE" >&2
 }
 
-if [[ -n "${MACHINE_ID:-}" ]]; then
-    if ! valid_machine_id "$MACHINE_ID"; then
-        echo "" >&2
-        echo "[ERR!] Invalid MACHINE_ID: '${MACHINE_ID}'" >&2
-        machine_id_instructions
-        exit 1
-    fi
-elif [[ -f "$MACHINE_ID_FILE" ]]; then
+if [[ -f "$MACHINE_ID_FILE" ]]; then
     MACHINE_ID=$(<"$MACHINE_ID_FILE")
     if ! valid_machine_id "$MACHINE_ID"; then
         echo "" >&2
@@ -45,18 +31,15 @@ elif [[ -f "$MACHINE_ID_FILE" ]]; then
     fi
 else
     echo "" >&2
-    echo "[WARN] No machine ID was provided." >&2
-    if [[ "$EPHEMERAL" == "1" ]]; then
-        echo "       Enter a device name for this run (it will not be saved)." >&2
-    else
-        echo "       Enter a device name to create ${MACHINE_ID_FILE}." >&2
-    fi
+    echo "[WARN] ${MACHINE_ID_FILE} was not found in the current directory:" >&2
+    echo "       $(pwd)" >&2
+    echo "       Let's create it now." >&2
     machine_id_instructions
     echo "" >&2
 
     if [[ ! -t 0 ]]; then
         echo "[ERR!] Cannot prompt for a device name because stdin is not a terminal." >&2
-        echo "       Set MACHINE_ID or create machineID.txt manually." >&2
+        echo "       Create machineID.txt manually in the current directory." >&2
         exit 1
     fi
 
@@ -68,11 +51,6 @@ else
         fi
 
         if valid_machine_id "$MACHINE_ID"; then
-            if [[ "$EPHEMERAL" == "1" ]]; then
-                echo "[ OK ] Using device name for this run: ${MACHINE_ID} (not saved)" >&2
-                break
-            fi
-
             if printf '%s\n' "$MACHINE_ID" > "$MACHINE_ID_FILE"; then
                 chmod 600 "$MACHINE_ID_FILE" 2>/dev/null || true
                 echo "[ OK ] Created ${MACHINE_ID_FILE} with device name: ${MACHINE_ID}" >&2

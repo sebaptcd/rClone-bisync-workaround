@@ -148,11 +148,25 @@ notify() {
     local title="$1"
     local body="$2"
 
+    # Notifications are best-effort and must never block the sync loop.
+    # termux-notification can wait for the Termux:API service (or hang when it
+    # is unavailable), which previously stopped the countdown and the next
+    # cycle. Run it in the background, with a timeout when available.
     # Termux has termux-notification; desktop Linux has notify-send.
     if command -v termux-notification &>/dev/null; then
-        termux-notification --title "$title" --content "$body" >/dev/null 2>&1 || true
+        if command -v timeout &>/dev/null; then
+            timeout 5 termux-notification --title "$title" --content "$body" \
+                >/dev/null 2>&1 &
+        else
+            termux-notification --title "$title" --content "$body" \
+                >/dev/null 2>&1 &
+        fi
     elif command -v notify-send &>/dev/null; then
-        notify-send "$title" "$body" >/dev/null 2>&1 || true
+        if command -v timeout &>/dev/null; then
+            timeout 5 notify-send "$title" "$body" >/dev/null 2>&1 &
+        else
+            notify-send "$title" "$body" >/dev/null 2>&1 &
+        fi
     fi
 
     log_msg "INFO" "${CLR_BOLD}${title}:${CLR_RESET} $body"
@@ -400,21 +414,29 @@ run_sync_cycle() {
     local is_first_run="${1:-false}"
     local live_log_remote="$LOG_REMOTE_PATH/LIVE_LOG.txt"
     local heartbeat_flag
+    local live_snapshot
     LOCAL_LOG_FILE="${TMPDIR:-/tmp}/mobilesync_cycle.$$.${CYCLE:-0}.log"
+    LIVE_LOG_SNAPSHOT="${TMPDIR:-/tmp}/mobilesync_live.$$.${CYCLE:-0}.log"
     local local_log="$LOCAL_LOG_FILE"
+    live_snapshot="$LIVE_LOG_SNAPSHOT"
     heartbeat_flag="${local_log}.heartbeat_error"
     : > "$local_log"
-    rm -f "$heartbeat_flag"
+    rm -f "$heartbeat_flag" "$live_snapshot"
 
     # Start background "log heartbeat" to provide live visibility.
-    # Failures are shown once, then at most once per minute.
+    # Copy a stable snapshot before uploading: uploading the log while tee is
+    # still appending to it makes rclone fail with "source file is being
+    # updated" or a quickxor mismatch. Failures are shown once, then at most
+    # once per minute.
     (
         local last_error_time=0
 
         while [[ -f "$local_log" ]]; do
             local now copy_error
 
-            if ! copy_error=$(rclone copyto "$local_log" "$live_log_remote" --color NEVER 2>&1); then
+            cp -f "$local_log" "$live_snapshot" 2>/dev/null
+
+            if ! copy_error=$(rclone copyto "$live_snapshot" "$live_log_remote" --color NEVER 2>&1); then
                 : > "$heartbeat_flag"
                 now=$(get_epoch)
 
@@ -532,6 +554,9 @@ run_sync_cycle() {
         LOG_HEARTBEAT_PID=""
     fi
 
+    rm -f "$live_snapshot"
+    LIVE_LOG_SNAPSHOT=""
+
     if [[ -f "$heartbeat_flag" ]]; then
         CYCLE_ISSUES=$(( CYCLE_ISSUES + 1 ))
         rm -f "$heartbeat_flag"
@@ -576,6 +601,7 @@ run_sync_cycle() {
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 LOCAL_LOG_FILE=""
+LIVE_LOG_SNAPSHOT=""
 LOG_HEARTBEAT_PID=""
 LOCK_PID=""
 LOCK_HB_ERR_FILE=""
@@ -597,6 +623,11 @@ cleanup() {
     if [[ -n "${LOCAL_LOG_FILE:-}" ]]; then
         rm -f "$LOCAL_LOG_FILE"
         LOCAL_LOG_FILE=""
+    fi
+
+    if [[ -n "${LIVE_LOG_SNAPSHOT:-}" ]]; then
+        rm -f "$LIVE_LOG_SNAPSHOT"
+        LIVE_LOG_SNAPSHOT=""
     fi
 
     if [[ -n "${LOCK_HB_ERR_FILE:-}" ]]; then
@@ -673,18 +704,29 @@ while true; do
     UI_PAUSED=false
     for (( i=SYNC_INTERVAL; i>0; i-- )); do
         if [[ "$UI_PAUSED" == "false" ]]; then
-            printf "\r${CLR_DIM}Next cycle in: %3d seconds... ${CLR_RESET}" "$i"
-            echo -ne "\n${CLR_ITALIC}(Press 'S' to sync, 'P' to pause UI and scroll)${CLR_RESET}\n"
+            if [[ -t 1 ]]; then
+                printf "\r${CLR_DIM}Next cycle in: %3d seconds... ${CLR_RESET}" "$i"
+                echo -ne "\n${CLR_ITALIC}(Press 'S' to sync, 'P' to pause UI and scroll)${CLR_RESET}\n"
+            else
+                printf "${CLR_DIM}Next cycle in: %3d seconds... ${CLR_RESET}\n" "$i"
+            fi
         fi
-        
-        # Wait 1 second for a character. -t 1 is the timeout, -n 1 is one character.
-        read -t 1 -n 1 key
-        
-        if [[ "$UI_PAUSED" == "false" ]]; then
+
+        # Wait 1 second for a character. -t 1 is the timeout, -n 1 is one
+        # character. If stdin is not a terminal (nohup, pipe, service), read
+        # returns immediately and the countdown would be skipped.
+        key=""
+        if [[ -t 0 ]]; then
+            read -t 1 -n 1 key
+        else
+            sleep 1
+        fi
+
+        if [[ "$UI_PAUSED" == "false" && -t 1 ]]; then
             # Move back up to Line 1
             echo -ne "\033[2F"
         fi
-        
+
         case "${key^^}" in
             S)
                 if [[ "$UI_PAUSED" == "false" ]]; then
@@ -710,7 +752,7 @@ while true; do
     done
     
     # Final cleanup of the countdown lines if we finished normally
-    if [[ "$UI_PAUSED" == "false" && $i -le 0 ]]; then
+    if [[ "$UI_PAUSED" == "false" && $i -le 0 && -t 1 ]]; then
          echo -ne "\r\033[K\n\033[K\033[F"
     fi
     echo -e "\n\r${CLR_SUCCESS}🚀 Starting next cycle!          ${CLR_RESET}"

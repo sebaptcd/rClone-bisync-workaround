@@ -383,7 +383,7 @@ On first run, choose `--resync` for each remote (`A` = all, `N` = none, `S` = se
 - only reports `Cycle completed` when every pair succeeded. Otherwise it prints a per-remote failure summary and tries again next cycle;
 - uploads a live log and a final log to `Dev:syncControl/Logs/<machineID>/`;
 - deletes remote logs older than 24 hours. If the upload fails, it keeps the local log and prints its path;
-- sends a Termux notification when a cycle fails (`termux-notification`, falling back to `notify-send`);
+- sends a Termux notification when a cycle fails (`termux-notification`, falling back to `notify-send`). Notifications run in the background, so an unavailable or stalled Termux:API service cannot block the countdown or the next cycle;
 - waits 5 minutes between cycles. Press `S` to skip the wait, or `P` to pause/resume the countdown display;
 - if the `Dev:` lock remote cannot be reached, shows the error and skips that cycle instead of syncing without the cross-machine lock. It retries on the next cycle;
 - uses `termux-wake-lock` when available so Android does not suspend the process.

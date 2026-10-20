@@ -19,19 +19,9 @@ If you have any suggestions or improvements, please open a pull request.
 
 ## Requirements
 
-- Linux with Bash and a running `cron` service (install it with `sudo apt install cron` if needed).
-- `rclone` installed and available on the `PATH` used by cron, with your remotes configured (`rclone config`).
-  - Use rclone **v1.71 or newer** for stable bisync. The script's `--resilient` and `--recover` flags require at least v1.66.
-  - Review rclone's [bisync limitations](https://rclone.org/bisync/#limitations) before using it with important data.
-- `notify-send` from `libnotify-bin` and a running desktop/DBus session:
-
-  ```bash
-  sudo apt install libnotify-bin
-  ```
-
-  The script runs with `set -e` and calls `notify-send` directly, so if notifications fail, the script may exit. A desktop session is therefore effectively required unless you adapt those calls.
-- `ping` (`iputils-ping`) for the internet check. The script pings `8.8.8.8`; on networks that block ICMP, adjust the check.
-- Run the script as your normal user, not as root. It uses your rclone configuration and your desktop session.
+- Linux with Bash, `cron`, `ping` (`iputils-ping`) and `notify-send` (`libnotify-bin`). The script needs a desktop session for notifications and can exit if one is unavailable.
+- `rclone` v1.66+ (v1.71+ recommended) in cron's `PATH`, with remotes configured (`rclone config`).
+- Run as your normal user, not as root.
 
 ## How it works
 
@@ -76,195 +66,105 @@ It contains `<unix timestamp> <machineID>`. While syncing, the active machine re
 
 ## Install
 
+The script syncs exactly four pairs: `Personal`, `PersonalPb`, `Dev` and `WORKSTATION`. The names are hard-coded; if you have fewer or more, edit the matching variables and the `rclone sync`/`bisync` calls in both the boot and cycle sections of `Syncing.sh`.
+
 ### 1. Place the files
 
-The default layout expected by `Syncing.sh` is:
-
 ```text
-/home/{user}/Desktop/rCloneSync/
-├── rClone-bisync-workaround/
-│   └── Syncing.sh
-├── 0. Private/
-│   └── rClone-bisync-workaround/
-│       └── var.sh
-├── Cloud/
-│   ├── {Provider 1}/
-│   └── {Provider 2}/
-├── {Provider 3}/
-│   └── Cloud/
-├── {Provider 4}/
-│   └── Cloud/
-├── Backup/
-│   └── rClone Backup/
-│       └── {Provider 1}/
-└── Setups/
-    └── rClone-bisync-workaround/
-        ├── machineID.txt
-        ├── Locks/
-        └── Logs/
-            ├── Boot/
-            │   └── Canceled/
-            └── Sync/
-                └── Canceled/
+/home/{user}/rCloneSync/
+├── rClone-bisync-workaround/Syncing.sh
+└── 0. Private/rClone-bisync-workaround/var.sh
 ```
 
-`Syncing.sh` sources `var.sh` from a path relative to its own directory:
-
-```bash
-source "$script_dir/../0. Private/rClone-bisync-workaround/var.sh"
-```
-
-If you put the files somewhere else, update that line in `Syncing.sh`.
+`Syncing.sh` sources `../0. Private/rClone-bisync-workaround/var.sh` relative to itself. If you use another layout, change that `source` line.
 
 ### 2. Create `var.sh`
 
-Create `/home/{user}/Desktop/rCloneSync/0. Private/rClone-bisync-workaround/var.sh` with your paths:
+Create `/home/{user}/rCloneSync/0. Private/rClone-bisync-workaround/var.sh`:
 
 ```bash
 #!/bin/bash
 
-# Parent folder for this script's state (locks, logs, machine ID).
-# Keep this path free of spaces: the script reads machineID.txt without quotes.
-Setups='/home/{user}/Desktop/rCloneSync/Setups'
+# Locks, logs and machine ID. Must not contain spaces.
+Setups='/home/{user}/rCloneSync/Setups'
 
-# Root of the recycle bin. The script uses "$recycle_bin_root/rClone bin".
-recycle_bin_root='/home/{user}/Desktop/rCloneSync/Backup'
+# Recycle bin parent: "$recycle_bin_root/rClone bin".
+recycle_bin_root='/home/{user}/rCloneSync/Backup'
 
-# Drive 1: Personal (boot sync uses rclone sync + bisync --resync)
+# Personal
 Personal_remote='{Provider 1}:'
-Personal_local='/home/{user}/Desktop/rCloneSync/Cloud/{Provider 1}'
-Personal_local_backup='/home/{user}/Desktop/rCloneSync/Backup/rClone Backup/{Provider 1}'
+Personal_local='/home/{user}/rCloneSync/Cloud/{Provider 1}'
+Personal_local_backup='/home/{user}/rCloneSync/Backup/{Provider 1}'
 
-# Drive 2
+# Personal/Public
 PersonalPb_remote='{Provider 2}:Drive'
-PersonalPb_local='/home/{user}/Desktop/rCloneSync/Cloud/{Provider 2}'
+PersonalPb_local='/home/{user}/rCloneSync/Cloud/{Provider 2}'
 
-# Drive 3
+# Dev
 Dev_remote='{Provider 3}:Drive'
-Dev_local='/home/{user}/Desktop/rCloneSync/{Provider 3}/Cloud'
+Dev_local='/home/{user}/rCloneSync/Cloud/{Provider 3}'
 
-# Drive 4
+# WORKSTATION
 WORKSTATION_remote='{Provider 4}:@WORKSTATION'
-WORKSTATION_local='/home/{user}/Desktop/rCloneSync/{Provider 4}/Cloud'
+WORKSTATION_local='/home/{user}/rCloneSync/Cloud/{Provider 4}'
 
-# Remote used for the cross-machine lock.
-# Use "Remote:" for the remote root, or "Remote:path/" for a subfolder.
+# Shared by every machine. "Remote:" for root, "Remote:path/" for a subfolder.
 SyncControl_root='{Provider of your choice}:'
 ```
 
-Notes:
+Replace every `{...}` placeholder. Remote names must match `rclone config`: `Name:` for the remote root, `Name:path` for a folder.
 
-- Replace every `{...}` placeholder.
-- Remote names must match the names in `rclone config`. A remote root is written as `Name:`; a folder inside it is `Name:path`.
-- The script reads exactly these variables. `Err` and `PersonalPb_root_remote` from older configurations are not used.
-- Keep `Setups` free of spaces. The script uses it unquoted when reading `machineID.txt`.
-- `SyncControl_root` must be reachable from every machine that runs the script. If you use a subfolder, end it with a slash (for example `'Dev:Apps/'`).
+- `Setups` must not contain spaces: `machineID.txt` is read unquoted from it.
+- `SyncControl_root` must not contain spaces, must point to the same location on every machine, and must end with `/` when it is a subfolder.
+- Only these variables are read. `Err` and `PersonalPb_root_remote` from older configurations are ignored.
 
-### 3. Configure rclone and create the local folders
-
-Configure the remotes:
+### 3. Create the folders and machine ID
 
 ```bash
-rclone config
+source "/home/{user}/rCloneSync/0. Private/rClone-bisync-workaround/var.sh"
+
+mkdir -p "$Personal_local" "$PersonalPb_local" "$Dev_local" "$WORKSTATION_local" \
+         "$Personal_local_backup" "$recycle_bin_root/rClone bin"
+
+mkdir -p "$Setups/rClone-bisync-workaround/Locks" \
+         "$Setups/rClone-bisync-workaround/Logs/Boot/Canceled" \
+         "$Setups/rClone-bisync-workaround/Logs/Sync/Canceled"
+
+printf '%s\n' 'DESKTOP-1' > "$Setups/rClone-bisync-workaround/machineID.txt"
+chmod 600 "$Setups/rClone-bisync-workaround/machineID.txt"
 ```
 
-Check each one:
+`machineID.txt` must be unique per computer and contain only letters, digits, `-` and `_` (no spaces). The script exits if the file is missing.
+
+The remote base path for each pair must exist as well; `bisync` aborts if it is missing. Create missing folders with `rclone mkdir '{Provider}:path'` (a remote root such as `{Provider}:` normally already exists).
+
+### 4. Rebuild the bisync baselines once
+
+Run these commands once before starting the script. Without a baseline, normal `bisync` runs abort and ask for `--resync`.
 
 ```bash
-rclone lsd "{Provider 1}:"
+source "/home/{user}/rCloneSync/0. Private/rClone-bisync-workaround/var.sh"
+
+FLAGS=(--transfers 64 --checkers 48 --create-empty-src-dirs --local-links
+       --fix-case --force --recover --resilient --max-lock 600)
+
+rclone bisync --resync "${FLAGS[@]}" "$Personal_local"     "$Personal_remote"
+rclone bisync --resync "${FLAGS[@]}" "$PersonalPb_remote"  "$PersonalPb_local"
+rclone bisync --resync "${FLAGS[@]}" "$Dev_remote"         "$Dev_local"
+rclone bisync --resync "${FLAGS[@]}" "$WORKSTATION_remote" "$WORKSTATION_local"
 ```
 
-Create the local folders from `var.sh`:
+`--resync` merges both sides; it is not a one-way mirror. On a conflict, the first path wins (local for `Personal`, remote for the other three). If both sides already contain data, run the commands with `--dry-run` first, then repeat without it.
+
+For `Personal`, run this before the first boot: the boot sync copies the remote to the local folder and would otherwise move local-only files to the recycle bin.
+
+### 5. Make the script executable
 
 ```bash
-mkdir -p \
-  "/home/{user}/Desktop/rCloneSync/Cloud/{Provider 1}" \
-  "/home/{user}/Desktop/rCloneSync/Cloud/{Provider 2}" \
-  "/home/{user}/Desktop/rCloneSync/{Provider 3}/Cloud" \
-  "/home/{user}/Desktop/rCloneSync/{Provider 4}/Cloud" \
-  "/home/{user}/Desktop/rCloneSync/Backup/rClone Backup/{Provider 1}"
+chmod +x "/home/{user}/rCloneSync/rClone-bisync-workaround/Syncing.sh"
 ```
 
-`Dev_local` and `WORKSTATION_local` are not under `Cloud/` in the example, which is why they are listed separately.
-
-### 4. Create the state folders and machine ID
-
-```bash
-mkdir -p \
-  "/home/{user}/Desktop/rCloneSync/Setups/rClone-bisync-workaround/Locks" \
-  "/home/{user}/Desktop/rCloneSync/Setups/rClone-bisync-workaround/Logs/Boot/Canceled" \
-  "/home/{user}/Desktop/rCloneSync/Setups/rClone-bisync-workaround/Logs/Sync/Canceled"
-
-printf '%s\n' 'DESKTOP-1' > \
-  "/home/{user}/Desktop/rCloneSync/Setups/rClone-bisync-workaround/machineID.txt"
-chmod 600 \
-  "/home/{user}/Desktop/rCloneSync/Setups/rClone-bisync-workaround/machineID.txt"
-```
-
-`machineID.txt` must be unique per computer. Use letters, numbers, `-`, and `_` only (no spaces). The script reads it from `$Setups/rClone-bisync-workaround/machineID.txt`; if the file is missing, the script exits.
-
-### 5. Initialize every bisync pair once
-
-Do not start the script for the first time before completing this step.
-
-`rclone bisync` needs a baseline listing for each pair. Without it, the first run aborts with:
-
-```text
-Bisync critical error: cannot find prior Path1 or Path2 listings ...
-Bisync aborted. Must run --resync to recover.
-```
-
-Run `--resync` once for each pair, using the same sync-related flags and argument order as the script. Review it with `--dry-run` first if both sides already contain data.
-
-```bash
-# Personal: local is Path1, remote is Path2 (same order as Syncing.sh)
-rclone bisync --resync \
-  --transfers 64 --checkers 48 --create-empty-src-dirs --local-links \
-  --fix-case --force --recover --resilient --max-lock 600 \
-  "/home/{user}/Desktop/rCloneSync/Cloud/{Provider 1}" \
-  "{Provider 1}:"
-
-# Personal/Public: remote is Path1, local is Path2
-rclone bisync --resync \
-  --transfers 64 --checkers 48 --create-empty-src-dirs --local-links \
-  --fix-case --force --recover --resilient --max-lock 600 \
-  "{Provider 2}:Drive" \
-  "/home/{user}/Desktop/rCloneSync/Cloud/{Provider 2}"
-
-# Dev
-rclone bisync --resync \
-  --transfers 64 --checkers 48 --create-empty-src-dirs --local-links \
-  --fix-case --force --recover --resilient --max-lock 600 \
-  "{Provider 3}:Drive" \
-  "/home/{user}/Desktop/rCloneSync/{Provider 3}/Cloud"
-
-# WORKSTATION
-rclone bisync --resync \
-  --transfers 64 --checkers 48 --create-empty-src-dirs --local-links \
-  --fix-case --force --recover --resilient --max-lock 600 \
-  "{Provider 4}:@WORKSTATION" \
-  "/home/{user}/Desktop/rCloneSync/{Provider 4}/Cloud"
-```
-
-`--resync` is **not** a one-way mirror. It rebuilds the bisync listings and merges both sides; on conflicts, Path1 wins. Running it for Personal before the first boot is important: the boot sync first runs `rclone sync` from the remote to the local folder, which would move local-only files to the recycle bin.
-
-### 6. Make the script executable
-
-```bash
-chmod +x "/home/{user}/Desktop/rCloneSync/rClone-bisync-workaround/Syncing.sh"
-```
-
-`var.sh` only needs to be readable; it does not need execute permission.
-
-### 7. Add the crontab entry
-
-Make sure cron is running:
-
-```bash
-sudo systemctl enable --now cron
-```
-
-Open your user crontab:
+### 6. Start it at boot
 
 ```bash
 crontab -e
@@ -273,44 +173,28 @@ crontab -e
 Add:
 
 ```cron
-# rClone bisync automation
 PATH=/usr/local/bin:/usr/bin:/bin
 XDG_RUNTIME_DIR=/run/user/1000
 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 
-@reboot sleep 30 && "/home/{user}/Desktop/rCloneSync/rClone-bisync-workaround/Syncing.sh" >> "/home/{user}/Desktop/rCloneSync/Setups/rClone-bisync-workaround/cron.log" 2>&1
+@reboot sleep 30 && "/home/{user}/rCloneSync/rClone-bisync-workaround/Syncing.sh" >> "/home/{user}/rCloneSync/Setups/rClone-bisync-workaround/cron.log" 2>&1
 ```
 
-Replace `1000` with your user ID (`id -u`). Check that `PATH` contains the directory reported by `command -v rclone`. If your desktop session uses a different display, edit the `export DISPLAY=:0` line in `Syncing.sh`.
+Replace both `1000`s with your UID (`id -u`), and make sure `PATH` contains the directory from `command -v rclone`. Increase `sleep 30` if your desktop session starts slowly. The two session variables are required for `notify-send`; without them the script can exit.
 
-Notes:
-
-- `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` let `notify-send` reach your desktop session from cron. If they are wrong, notifications fail and the script may exit.
-- Increase the first `sleep 30` if your desktop session takes longer to start.
-- `@reboot` starts the script once. The script then loops forever. If it exits, cron will not restart it until the next boot; start it manually or use a service manager if you need automatic restarts.
-- The `cron.log` redirection captures output that is not written to the boot/sync lock files, including early startup errors.
-
-### 8. Test it
-
-Syntax-check the scripts first:
+### 7. Test it
 
 ```bash
-bash -n "/home/{user}/Desktop/rCloneSync/rClone-bisync-workaround/Syncing.sh"
-bash -n "/home/{user}/Desktop/rCloneSync/0. Private/rClone-bisync-workaround/var.sh"
+bash -n "/home/{user}/rCloneSync/rClone-bisync-workaround/Syncing.sh"
+"/home/{user}/rCloneSync/rClone-bisync-workaround/Syncing.sh"
 ```
 
-Then start it in the foreground and watch the output:
-
-```bash
-"/home/{user}/Desktop/rCloneSync/rClone-bisync-workaround/Syncing.sh"
-```
-
-You can stop it with `Ctrl+C`. If a bisync run was interrupted, the next run uses `--recover`; if rclone still asks for a resync, run the matching command from step 5. A leftover lock file is detected on the next start and moved to `Canceled` after a 5-minute wait. Check `Logs/Boot/` and `Logs/Sync/` for completed runs, and `cron.log` for early errors.
+The first start runs the boot sync, waits 5 minutes and begins the regular cycles. Completed runs are in `$Setups/rClone-bisync-workaround/Logs/`; early startup errors are in `$Setups/rClone-bisync-workaround/cron.log`.
 
 ## Troubleshooting
 
 - **Script exits immediately:** verify that `var.sh` exists at the path in `source`, all paths in it exist, `machineID.txt` exists, and `rclone` is on the cron `PATH`.
-- **`Bisync aborted. Must run --resync`:** run the resync command for that pair from step 5. This can also happen after an unrecoverable bisync error.
+- **`Bisync aborted. Must run --resync`:** run the resync command for that pair from step 4. This can also happen after an unrecoverable bisync error.
 - **No notifications or the script exits when notifying:** test `notify-send` as the same user, check `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, and make sure `libnotify-bin` is installed.
 - **Nothing runs after reboot:** check `systemctl status cron`, the `cron.log` file, and that the script is executable.
 - **Two machines wait on each other:** the custom lock is stale after 120 seconds. Check the remote `syncControl/syncTime.lock` and remove it manually if needed. rclone's own lock (`--max-lock 600`) is separate.

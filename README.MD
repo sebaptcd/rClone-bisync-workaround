@@ -70,10 +70,32 @@ The script syncs exactly four pairs: `Personal`, `PersonalPb`, `Dev` and `WORKST
 
 ### 1. Place the files
 
+The full layout expected by `Syncing.sh`:
+
 ```text
 /home/{user}/rCloneSync/
-├── rClone-bisync-workaround/Syncing.sh
-└── 0. Private/rClone-bisync-workaround/var.sh
+├── rClone-bisync-workaround/
+│   └── Syncing.sh
+├── 0. Private/
+│   └── rClone-bisync-workaround/
+│       └── var.sh
+├── Cloud/
+│   ├── {Provider 1}/
+│   ├── {Provider 2}/
+│   ├── {Provider 3}/
+│   └── {Provider 4}/
+├── Backup/
+│   ├── {Provider 1}/
+│   └── rClone bin/
+└── Setups/
+    └── rClone-bisync-workaround/
+        ├── machineID.txt
+        ├── Locks/
+        └── Logs/
+            ├── Boot/
+            │   └── Canceled/
+            └── Sync/
+                └── Canceled/
 ```
 
 `Syncing.sh` sources `../0. Private/rClone-bisync-workaround/var.sh` relative to itself. If you use another layout, change that `source` line.
